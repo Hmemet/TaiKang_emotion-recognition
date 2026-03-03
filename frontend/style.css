@@ -306,3 +306,36 @@ pre {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* 示例句子样式 */
+.examples-section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(148, 163, 184, 0.3);
+}
+.example-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.example-btn {
+  width: 100%;
+  text-align: left;
+  padding: 10px 14px;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.95) 0%, rgba(241, 245, 249, 0.9) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 8px;
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 4px rgba(15, 23, 42, 0.06);
+}
+.example-btn:hover {
+  background: linear-gradient(180deg, #e0f2fe 0%, #dbeafe 100%);
+  border-color: #3b82f6;
+  color: #1e40af;
+  transform: translateX(4px);
+  box-shadow: 0 4px 8px rgba(59, 130, 246, 0.15);
+}

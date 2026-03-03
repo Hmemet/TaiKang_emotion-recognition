@@ -4,6 +4,8 @@ const topK = document.getElementById('topK');
 const predictBtn = document.getElementById('predictBtn');
 const batchBtn = document.getElementById('batchBtn');
 const healthBtn = document.getElementById('healthBtn');
+const clearBtn = document.getElementById('clearBtn');
+const exampleBtns = document.querySelectorAll('.example-btn');
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
 const historyEl = document.getElementById('history');
@@ -432,6 +434,20 @@ backFromDetail.addEventListener('click', () => {
 });
 clearHistoryBtn.addEventListener('click', clearHistory);
 exportDetailBtn.addEventListener('click', exportCurrentDetail);
+
+// 清除内容按钮
+clearBtn.addEventListener('click', () => {
+  inputText.value = '';
+  setStatus('已清除输入内容');
+});
+
+// 示例句子点击填充
+exampleBtns.forEach(btn => {
+  btn.addEventListener('click', () => {
+    inputText.value = btn.dataset.text;
+    setStatus('已填充示例文本');
+  });
+});
 
 switchMainPage('predict');
 switchMode('single');

@@ -10,7 +10,7 @@
     <main class="container">
       <header class="hero">
         <h1>细粒度情绪识别系统</h1>
-        <p class="hint hero-hint">支持单条与批量预测，前端通过 API 调用后端服务。</p>
+        <p class="hint hero-hint">支持单条与批量预测，只支持英文文本。</p>
         <div class="top-tabs">
           <button id="tabPredict" class="tab-btn active">情绪预测</button>
           <button id="tabHistory" class="tab-btn">历史记录</button>
@@ -36,10 +36,21 @@
           </div>
 
           <div id="singleMode" class="mode-section">
-            <label for="inputText">待分析文本</label>
-            <textarea id="inputText" placeholder="例如：今天拿到 offer 了，太开心了！"></textarea>
+            <label for="inputText">待分析文本</label>    
+            <textarea id="inputText"></textarea>     
             <div class="row">
               <button id="predictBtn">开始预测</button>
+              <button id="clearBtn" class="secondary">清除内容</button>
+            </div>
+            <div class="examples-section">
+              <p class="hint small">试试这些示例（点击填充）：</p>
+              <div class="example-list">
+                <button class="example-btn" data-text="I'm so excited about the new project! It's going to be amazing!">I'm so excited about the new project! It's going to be amazing!</button>
+                <button class="example-btn" data-text="This is really frustrating, I can't believe this happened.">This is really frustrating, I can't believe this happened.</button>
+                <button class="example-btn" data-text="I love spending time with my family, they're the best.">I love spending time with my family, they're the best.</button>
+                <button class="example-btn" data-text="That's interesting, tell me more about it.">That's interesting, tell me more about it.</button>
+                <button class="example-btn" data-text="I feel neutral about this, nothing special.">I feel neutral about this, nothing special.</button>
+              </div>
             </div>
           </div>
 
