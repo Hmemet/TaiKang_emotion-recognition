@@ -1,0 +1,555 @@
+  import os
+os.environ['HF_HOME'] = 'C:/hf_cache'  # 使用英文路径
+os.environ['TRANSFORMERS_CACHE'] = 'C:/hf_cache'
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import torch
+import torch.nn as nn
+import pandas as pd
+import ast
+import numpy as np
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from torch.optim import AdamW
+from sklearn.metrics import f1_score
+from tqdm import tqdm
+from model import EmotionClassifier
+import json
+from torch.amp import autocast, GradScaler
+from peft import LoraConfig, get_peft_model, TaskType       
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_NAME = 'microsoft/deberta-v3-base'
+MAX_LEN = 128
+BATCH_SIZE = 16
+WEIGHT_DECAY = 0.05
+DEFAULT_EPOCHS = 3
+LR = 1e-5
+ACCUM_STEPS = 2
+DEFAULT_GAMMA = 1
+# 采样与少类增强相关配置（可通过环境变量覆盖）
+#SAMPLER_SCALE = float(os.environ.get('SAMPLER_SCALE', '1.0'))
+# 默认使用在短跑中表现最好的配置：SMALL_CLASS_BOOST 默认设为 1.5
+#SMALL_CLASS_BOOST = float(os.environ.get('SMALL_CLASS_BOOST', '1.2'))
+SMALL_CLASS_PERCENTILE = float(os.environ.get('SMALL_CLASS_PERCENTILE', '25'))
+
+TRAIN_CSV = 'data/processed/train_augmented.csv'
+VAL_CSV = 'data/processed/val.csv'  
+
+class EmotionDataset(Dataset):
+    def __init__(self, csv_path, tokenizer):
+        self.df = pd.read_csv(csv_path)
+        self.tokenizer = tokenizer
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, idx):
+        text = str(self.df.iloc[idx]['text'])
+        target = torch.zeros(28)
+        for i in ast.literal_eval(self.df.iloc[idx]['labels']):
+            target[i] = 1.0
+        encoding = self.tokenizer(text, add_special_tokens=True, max_length=MAX_LEN,
+                                  padding='max_length', truncation=True, return_tensors='pt')
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': target
+        }
+
+
+def get_pos_weights(dataset):
+    print("正在计算类别权重...")
+    all_labels = [dataset[i]['labels'].numpy() for i in range(len(dataset))]
+    pos_counts = np.array(all_labels).sum(axis=0)
+    neg_counts = len(dataset) - pos_counts
+
+    pos_weights = neg_counts / (pos_counts + 1e-5)
+
+    pos_weights = np.sqrt(pos_weights)
+
+    # 限制上限以减少极端类对训练的不稳定影响
+    pos_weights = np.clip(pos_weights, 1.0, 12.0)
+
+    # 可选：根据少类百分位增强少类的 pos_weight
+    try:
+        threshold_count = np.percentile(pos_counts, SMALL_CLASS_PERCENTILE)
+        rare_mask = pos_counts < threshold_count
+        if rare_mask.any() and SMALL_CLASS_BOOST != 1.0:
+            pos_weights[rare_mask] = pos_weights[rare_mask] * SMALL_CLASS_BOOST
+            pos_weights = np.clip(pos_weights, 1.0, 12.0)
+            print(f"Boosted pos_weights for {int(rare_mask.sum())} rare classes with factor {SMALL_CLASS_BOOST}")
+    except Exception:
+        pass
+
+    print("pos_counts:", pos_counts.astype(int).tolist())
+    print("pos_weights (clipped sqrt + boost):", np.round(pos_weights, 3).tolist())
+
+    return torch.tensor(pos_weights, dtype=torch.float32).to(DEVICE)
+
+
+def compute_sample_weights(dataset, pos_weights):
+    """Compute per-sample weights for WeightedRandomSampler.
+    Strategy:
+    - Compute per-class inverse-frequency weights (w_c = 1 / (pos_count_c + eps)).
+    - Normalize class weights to mean 1 and clip to avoid extreme values.
+    - For each sample, sample weight = sum(class_weights for classes present in sample).
+    - Normalize sample weights to mean 1 for numerical stability.
+    """
+    labels_list = [dataset[i]['labels'].numpy() for i in range(len(dataset))]
+    # recover class positive counts
+    all_labels = np.array(labels_list)
+    pos_counts = all_labels.sum(axis=0)
+    eps = 1e-6
+    class_weights = 1.0 / (pos_counts + eps)
+    # normalize class weights to mean 1
+    class_weights = class_weights / class_weights.mean()
+    # clip to avoid extreme sampling; 收紧上界防止极端过采样
+    class_weights = np.clip(class_weights, 0.8, 6.0)
+
+    weights = []
+    for lbl in labels_list:
+        idx = np.where(lbl == 1)[0]
+        if len(idx) == 0:
+            w = 1.0
+        else:
+            w = float(class_weights[idx].sum())
+        weights.append(w)
+    weights = np.array(weights, dtype=np.float32)
+    weights = weights / weights.mean()
+    return weights
+
+
+class FocalLoss(nn.Module):
+    """Multi-label focal loss built on top of BCEWithLogitsLoss.
+    Uses per-class pos_weight if provided.
+    """
+    def __init__(self, pos_weight=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        # pos_weight should be a tensor or None
+        if pos_weight is not None:
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
+        else:
+            self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, logits, targets):
+        # logits, targets: (batch, classes)
+        bce_loss = self.bce(logits, targets)
+        probs = torch.sigmoid(logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        focal_factor = (1 - p_t) ** self.gamma
+        loss = focal_factor * bce_loss
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+def search_thresholds(preds, targets, low=0.1, high=0.9, step=0.01):
+    """Search best threshold for each class independently on validation set.
+    preds, targets: numpy arrays shape (N, C)
+    Returns thresholds array of length C.
+    """
+    n_classes = preds.shape[1]
+    thresholds = np.full(n_classes, 0.5)
+    for i in range(n_classes):
+        best_t = 0.5
+        best_f1 = 0.0
+        t = low
+        while t <= high:
+            score = f1_score(targets[:, i], preds[:, i] > t, zero_division=0)
+            if score > best_f1:
+                best_f1 = score
+                best_t = t
+            t = round(t + step, 6)
+        thresholds[i] = best_t
+    return thresholds
+
+
+def train(focal_gamma=None, epochs_override=None, use_subset=False, subset_size=2000, sampler_scale=None, small_class_boost=None, dropout_rate=0.2):
+    GAMMA = focal_gamma if focal_gamma is not None else DEFAULT_GAMMA
+    EPOCHS = epochs_override if epochs_override is not None else DEFAULT_EPOCHS
+    print(f"当前配置: Gamma={GAMMA}, Epochs={EPOCHS}, Subset={use_subset}")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    train_ds = EmotionDataset(TRAIN_CSV, tokenizer)
+    val_ds = EmotionDataset(VAL_CSV, tokenizer)
+
+    if use_subset:
+        print(f"[短跑模式]激活,仅使用前 {subset_size} 条训练数据...")
+        # 直接修改 DataFrame，只保留前 subset_size 行
+        train_ds.df = train_ds.df.iloc[:subset_size].reset_index(drop=True)
+        print(f"原始数据量: {len(train_ds.df) + (len(pd.read_csv(TRAIN_CSV)) - subset_size)} -> 截断后: {len(train_ds.df)}")
+    else:
+        print("[全量模式] 使用全部训练数据。")
+    
+    SAMPLER_SCALE = sampler_scale if sampler_scale is not None else float(os.environ.get('SAMPLER_SCALE', '1.2'))
+    SMALL_CLASS_BOOST = small_class_boost if small_class_boost is not None else float(os.environ.get('SMALL_CLASS_BOOST', '1.2'))
+    
+    # 将最终值写回环境变量，这样 train.py 内部的 get_pos_weights 和 compute_sample_weights 就能读到
+    os.environ['SAMPLER_SCALE'] = str(SAMPLER_SCALE)
+    os.environ['SMALL_CLASS_BOOST'] = str(SMALL_CLASS_BOOST)
+
+
+    pos_weights = get_pos_weights(train_ds)
+
+    # 可选：使用 WeightedRandomSampler 对少数类过采样（通过环境变量控制）
+    use_sampler = os.environ.get('USE_SAMPLER', '1') == '1'
+    if use_sampler:
+        sample_weights = compute_sample_weights(train_ds, pos_weights)
+        # 应用采样强度缩放并归一化到均值 1
+        try:
+            sample_weights = sample_weights * SAMPLER_SCALE
+            sample_weights = sample_weights / sample_weights.mean()
+        except Exception:
+            pass
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+
+    model = EmotionClassifier(MODEL_NAME, 28, dropout_rate=dropout_rate).to(DEVICE)
+    model.float()
+
+
+    # 使用 Focal Loss 作为 criterion，缓解类别不平衡
+    criterion = FocalLoss(pos_weight=pos_weights, gamma=GAMMA, reduction='mean')
+
+#检查是否存在最佳模型，如果有则加载 
+    RESUME_FROM_CHECKPOINT = False  #  设置为 True 表示要续训
+    checkpoint_path = 'best_model.pth'
+
+    if RESUME_FROM_CHECKPOINT and os.path.exists(checkpoint_path):
+        print(f"正在加载已有权重进行续训: {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+        print("模型权重加载成功。")
+    else:
+        print("未找到权重或选择不加载，将从头训练。")
+
+    if RESUME_FROM_CHECKPOINT and os.path.exists(checkpoint_path):
+        # 续训时：使用更小的学习率，且不需要 Warmup (或极短 Warmup)
+        LR_FINETUNE = LR * 0.2 
+        WARMUP_RATIO = 0.05     # 缩短 Warmup 比例，避免初期震荡
+        print(f"检测到续训模式：学习率已自动调整为 {LR_FINETUNE} (原 LR 的 20%)")
+        optimizer = AdamW(model.parameters(), lr=LR_FINETUNE, weight_decay=WEIGHT_DECAY)
+    else:
+        # 从头训练：使用原定参数
+        optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+        WARMUP_RATIO = 0.1
+   
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * 0.1),
+        num_training_steps=total_steps
+    )
+
+
+    # AMP scaler for mixed precision
+    scaler = GradScaler()
+
+    # 可选：做 Focal gamma 的短跑网格搜索（通过环境变量 GRID_GAMMAS 激活，逗号分隔）
+    def grid_search_gamma(gamma_list, short_epochs=1, subset_size=1000, num_workers=2):
+        """Faster short runs for gamma grid search.
+        - Uses a subset of the training data (first `subset_size` samples).
+        - Runs `short_epochs` (default 1) per gamma.
+        - Displays progress with tqdm and uses recommended torch.amp API.
+        """
+        from torch.utils.data import Subset
+        from tqdm import tqdm
+
+        results = {}
+        subset_size = min(subset_size, len(train_ds))
+        subset_indices = list(range(subset_size))
+        train_subset = Subset(train_ds, subset_indices)
+
+        for g in gamma_list:
+            print(f"Grid-search (fast): testing gamma={g}")
+            model_g = EmotionClassifier(MODEL_NAME, 28).to(DEVICE)
+            model_g.float()
+            criterion_g = FocalLoss(pos_weight=pos_weights, gamma=g, reduction='mean')
+            optim_g = AdamW(model_g.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+            total_steps_g = (len(train_subset) // BATCH_SIZE + 1) * short_epochs
+            sched_g = get_cosine_schedule_with_warmup(optim_g, num_warmup_steps=int(total_steps_g * 0.1), num_training_steps=total_steps_g)
+            scaler_g = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else torch.amp.GradScaler()
+
+            train_loader_short = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers)
+
+            best_f1_g = 0.0
+            for e in range(short_epochs):
+                model_g.train()
+                for step, batch in enumerate(tqdm(train_loader_short, desc=f"g={g} train", leave=False)):
+                    ids = batch['input_ids'].to(DEVICE)
+                    mask = batch['attention_mask'].to(DEVICE)
+                    targets = batch['labels'].to(DEVICE)
+                    with torch.amp.autocast('cuda'):
+                        outputs = model_g(ids, mask)
+                        loss = criterion_g(outputs, targets) / ACCUM_STEPS
+                    scaler_g.scale(loss).backward()
+                    if (step + 1) % ACCUM_STEPS == 0:
+                        scaler_g.unscale_(optim_g)
+                        torch.nn.utils.clip_grad_norm_(model_g.parameters(), 1.0)
+                        scaler_g.step(optim_g)
+                        scaler_g.update()
+                        sched_g.step()
+                        optim_g.zero_grad()
+
+                # 验证（使用完整验证集）
+                model_g.eval()
+                all_p, all_t = [], []
+                with torch.no_grad():
+                    for batch in val_loader:
+                        logits = model_g(batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE))
+                        probs = torch.sigmoid(logits)
+                        all_p.extend(probs.cpu().numpy())
+                        all_t.extend(batch['labels'].numpy())
+                p_arr = np.array(all_p)
+                t_arr = np.array(all_t)
+                th = search_thresholds(p_arr, t_arr, low=0.1, high=0.9, step=0.01)
+                pbin = (p_arr > th).astype(int)
+                f = f1_score(t_arr, pbin, average='macro', zero_division=0)
+                print(f"gamma={g} short-epoch {e+1} val_f1={f:.4f}")
+                if f > best_f1_g:
+                    best_f1_g = f
+            results[g] = best_f1_g
+
+        # 保存结果
+        try:
+            with open('gamma_grid_results.json', 'w', encoding='utf-8') as f:
+                json.dump({'results': {str(k): v for k, v in results.items()}}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return results
+
+
+    def sampler_grid(sampler_scales, boost_list, short_epochs=1, subset_size=1000, num_workers=2):
+        """Short-run grid over sampler scale and small-class boost.
+        Runs on a subset for speed and returns a dict of results.
+        """
+        from torch.utils.data import Subset
+        results = {}
+        subset_size = min(subset_size, len(train_ds))
+        subset_indices = list(range(subset_size))
+        train_subset = Subset(train_ds, subset_indices)
+
+        for scale in sampler_scales:
+            for boost in boost_list:
+                key = f"scale={scale}_boost={boost}"
+                print(f"Sampler-grid testing {key}")
+                # recompute pos_weights on subset with this boost
+                global SMALL_CLASS_BOOST
+                orig_boost = SMALL_CLASS_BOOST
+                SMALL_CLASS_BOOST = float(boost)
+                pos_w_sub = get_pos_weights(train_subset)
+                SMALL_CLASS_BOOST = orig_boost
+
+                sample_w = compute_sample_weights(train_subset, pos_w_sub)
+                # apply scale and normalize
+                try:
+                    sample_w = sample_w * float(scale)
+                    sample_w = sample_w / sample_w.mean()
+                except Exception:
+                    pass
+
+                sampler_sub = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
+                loader_sub = DataLoader(train_subset, batch_size=BATCH_SIZE, sampler=sampler_sub, num_workers=num_workers)
+
+                model_g = EmotionClassifier(MODEL_NAME, 28).to(DEVICE)
+                model_g.float()
+                criterion_g = FocalLoss(pos_weight=pos_w_sub, gamma=GAMMA, reduction='mean')
+                optim_g = AdamW(model_g.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+                total_steps_g = (len(loader_sub) // BATCH_SIZE + 1) * short_epochs
+                sched_g = get_cosine_schedule_with_warmup(optim_g, num_warmup_steps=int(total_steps_g * 0.1), num_training_steps=total_steps_g)
+                scaler_g = GradScaler()
+
+                best_f1 = 0.0
+                for e in range(short_epochs):
+                    model_g.train()
+                    for step, batch in enumerate(loader_sub):
+                        ids = batch['input_ids'].to(DEVICE)
+                        mask = batch['attention_mask'].to(DEVICE)
+                        targets = batch['labels'].to(DEVICE)
+                        with autocast('cuda'):
+                            outputs = model_g(ids, mask)
+                            loss = criterion_g(outputs, targets) / ACCUM_STEPS
+                        scaler_g.scale(loss).backward()
+                        if (step + 1) % ACCUM_STEPS == 0:
+                            scaler_g.unscale_(optim_g)
+                            torch.nn.utils.clip_grad_norm_(model_g.parameters(), max_norm=1.0)
+                            scaler_g.step(optim_g)
+                            scaler_g.update()
+                            sched_g.step()
+                            optim_g.zero_grad()
+
+                    # validate on full val set
+                    model_g.eval()
+                    all_p, all_t = [], []
+                    with torch.no_grad():
+                        for batch in val_loader:
+                            logits = model_g(batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE))
+                            probs = torch.sigmoid(logits)
+                            all_p.extend(probs.cpu().numpy())
+                            all_t.extend(batch['labels'].numpy())
+                    p_arr = np.array(all_p)
+                    t_arr = np.array(all_t)
+                    th = search_thresholds(p_arr, t_arr, low=0.1, high=0.9, step=0.01)
+                    pbin = (p_arr > th).astype(int)
+                    f = f1_score(t_arr, pbin, average='macro', zero_division=0)
+                    print(f"{key} short-epoch {e+1} val_f1={f:.4f}")
+                    if f > best_f1:
+                        best_f1 = f
+
+                results[key] = float(best_f1)
+
+        # save
+        try:
+            with open('sampler_grid_results.json', 'w', encoding='utf-8') as f:
+                json.dump({'results': results}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return results
+
+    # 支持通过环境变量一次性触发 sampler_grid 并退出（用于自动化脚本）
+    if os.environ.get('RUN_SAMPLER_GRID', '0') == '1':
+        scales = os.environ.get('SAMPLER_GRID_SCALES', '0.5,1.0,2.0').split(',')
+        scales = [float(x) for x in scales]
+        boosts = os.environ.get('SAMPLER_GRID_BOOSTS', '1.1,1.3,1.5').split(',')
+        boosts = [float(x) for x in boosts]
+        short_epochs = int(os.environ.get('SAMPLER_GRID_EPOCHS', '1'))
+        subset_size = int(os.environ.get('SAMPLER_GRID_SUBSET', '1000'))
+        print(f"Running sampler_grid with scales={scales} boosts={boosts} short_epochs={short_epochs} subset={subset_size}")
+        res = sampler_grid(scales, boosts, short_epochs=short_epochs, subset_size=subset_size)
+        print('Sampler grid finished. Results saved to sampler_grid_results.json')
+        return
+
+
+
+    # Early stopping / LR scheduling helpers
+    best_f1 = 0.0
+    patience = 2
+    min_delta = 1e-4
+    no_improve_epochs = 0
+    lr_reduced = False
+    stop_training = False
+    for epoch in range(EPOCHS):
+        model.train()
+
+        loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}", leave=False)
+        for step, batch in enumerate(loop):
+            ids = batch['input_ids'].to(DEVICE)
+            mask = batch['attention_mask'].to(DEVICE)
+            targets = batch['labels'].to(DEVICE)
+
+            with autocast('cuda'):
+                outputs = model(ids, mask)
+                loss = criterion(outputs, targets)
+                loss = loss / ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+
+            # 梯度累积，每 ACCUM_STEPS 步更新一次参数
+            if (step + 1) % ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+        # 如果最后一轮未被整除，强制更新一次
+        if (step + 1) % ACCUM_STEPS != 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        model.eval()
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                logits = model(batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE))
+                probs = torch.sigmoid(logits)
+                all_preds.extend(probs.cpu().numpy())
+                all_targets.extend(batch['labels'].numpy())
+
+        preds_array = np.array(all_preds)
+        targets_array = np.array(all_targets)
+        max_prob = preds_array.max()
+
+
+        # 为每个类别在验证集上单独搜索最佳阈值并计算每类 F1
+        thresholds = search_thresholds(preds_array, targets_array, low=0.1, high=0.9, step=0.01)
+        try:
+            with open('best_thresholds.json', 'w', encoding='utf-8') as f:
+                json.dump({'thresholds': thresholds.tolist()}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        preds_bin = (preds_array > thresholds).astype(int)
+        # 计算宏与微 F1
+        best_val_f1 = f1_score(targets_array, preds_bin, average='macro', zero_division=0)
+        micro_f1 = f1_score(targets_array, preds_bin, average='micro', zero_division=0)
+
+        # 每类 f1 以便定位问题
+        per_class_f1 = f1_score(targets_array, preds_bin, average=None, zero_division=0)
+        try:
+            per_class_f1_list = [float(round(x, 4)) for x in per_class_f1]
+        except Exception:
+            per_class_f1_list = per_class_f1.tolist()
+        print("Per-class F1:", per_class_f1_list)
+
+        # 保存评估报告
+        try:
+            eval_report = {
+                'best_val_f1': float(best_val_f1),
+                'micro_f1': float(micro_f1),
+                'max_prob': float(max_prob),
+                'thresholds': thresholds.tolist(),
+                'per_class_f1': per_class_f1_list
+            }
+            with open('eval_report.json', 'w', encoding='utf-8') as f:
+                json.dump(eval_report, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        print(f"Epoch {epoch + 1} | Macro F1: {best_val_f1:.4f} | Micro F1: {micro_f1:.4f} | Max Prob: {max_prob:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+
+        # Early-stopping + lr-reduction + rollback logic
+        if (best_val_f1 > best_f1 + min_delta) and not np.isnan(max_prob):
+            best_f1 = best_val_f1
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f"Saved Best Model with F1: {best_f1:.4f}")
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+            print(f"No improvement for {no_improve_epochs} epoch(s).")
+
+        if no_improve_epochs >= patience:
+            # 如果尚未降过 lr，则先回滚至 best model 并降低 lr 一次再继续训练
+            if not lr_reduced:
+                if os.path.exists('best_model.pth'):
+                    model.load_state_dict(torch.load('best_model.pth', map_location=DEVICE))
+                    print('Restored best_model.pth before LR reduction')
+                for g in optimizer.param_groups:
+                    old = g['lr']
+                    g['lr'] = old * 0.5
+                print('Reduced learning rate by 0.5 and resuming training')
+                lr_reduced = True
+                no_improve_epochs = 0
+            else:
+                print('No improvement after LR reduction — stopping training.')
+                stop_training = True
+
+        if stop_training:
+            break
+    return best_f1
+
+if __name__ == "__main__":
+    train()

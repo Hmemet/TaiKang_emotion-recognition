@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>细粒度情绪识别</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="hero">
+        <h1>细粒度情绪识别系统</h1>
+        <p class="hint hero-hint">支持单条与批量预测，前端通过 API 调用后端服务。</p>
+        <div class="top-tabs">
+          <button id="tabPredict" class="tab-btn active">情绪预测</button>
+          <button id="tabHistory" class="tab-btn">历史记录</button>
+          <button id="healthBtn" class="tab-btn secondary">后端检查</button>
+        </div>
+      </header>
+
+      <section class="panel status-panel">
+        <h2>状态输出</h2>
+        <pre id="status">等待操作...</pre>
+      </section>
+
+      <section id="predictPage">
+        <section class="panel predict-input-panel">
+          <div class="mode-tabs">
+            <button id="modeSingle" class="tab-btn active">单条预测</button>
+            <button id="modeBatch" class="tab-btn">批量预测</button>
+          </div>
+
+          <div class="row row-topk">
+            <label for="topK">Top K</label>
+            <input id="topK" type="number" min="1" max="28" value="5" />
+          </div>
+
+          <div id="singleMode" class="mode-section">
+            <label for="inputText">待分析文本</label>
+            <textarea id="inputText" placeholder="例如：今天拿到 offer 了，太开心了！"></textarea>
+            <div class="row">
+              <button id="predictBtn">开始预测</button>
+            </div>
+          </div>
+
+          <div id="batchMode" class="mode-section hidden">
+            <p class="hint small">每行一条文本，点击“批量预测”会调用 <code>/api/predict/batch</code></p>
+            <textarea id="batchText" placeholder="第一条文本&#10;第二条文本&#10;第三条文本"></textarea>
+            <div class="row">
+              <button id="batchBtn" class="secondary">批量预测</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>预测结果</h2>
+          <div id="result" class="result-empty">暂无结果</div>
+        </section>
+      </section>
+
+      <section id="historyPage" class="hidden">
+        <section class="panel">
+          <div class="row detail-head">
+            <h2>历史记录</h2>
+            <button id="clearHistory" class="secondary">清空历史</button>
+          </div>
+          <div id="history" class="result-empty">暂无历史记录</div>
+        </section>
+      </section>
+
+      <section id="detailPage" class="hidden">
+        <section class="panel">
+          <div class="row detail-head">
+            <h2 id="detailTitle">预测详情</h2>
+            <div class="row">
+              <button id="exportDetail" class="secondary">导出 JSON</button>
+              <button id="backFromDetail" class="secondary">返回</button>
+            </div>
+          </div>
+          <div id="detailMeta" class="hint small"></div>
+          <div id="chart" class="chart"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
