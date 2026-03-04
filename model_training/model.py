@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModel, AutoConfig
 
 class EmotionClassifier(nn.Module):
-    def __init__(self, model_name='microsoft/deberta-v3-small', num_labels=28,
+    def __init__(self, model_name='microsoft/deberta-v3-base', num_labels=28,
                  dropout_rate=0.2):
         super(EmotionClassifier, self).__init__()   
         #加载配置
